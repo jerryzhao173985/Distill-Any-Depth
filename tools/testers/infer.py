@@ -39,7 +39,28 @@ def argument_parser():
     parser.add_argument("--output_processing_res", action="store_true", help="Output depth at resized operating resolution.")
     parser.add_argument("--resample_method", type=str, default="bilinear", help="Resampling method used to resize images.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
+    parser.add_argument("--use_cpu", action="store_true", help="Force using CPU even if CUDA or MPS is available.")
+    parser.add_argument("--no_mps", action="store_true", help="Disable MPS even if available (will use CPU).")
     return parser
+
+# Helper function to get appropriate device
+def get_device(args):
+    if torch.cuda.is_available() and not args.use_cpu:
+        gpu_id = comm.get_rank() if torch.cuda.device_count() > 0 else 0
+        device = torch.device(f"cuda:{gpu_id}")
+        logging.info(f'Using CUDA device {gpu_id}')
+        return device, "cuda"
+    
+    # Check for MPS availability (available on Mac with M-series chips)
+    # Only available on PyTorch 1.12+ and macOS 12.3+
+    if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and not args.use_cpu and not args.no_mps:
+        device = torch.device("mps")
+        logging.info('Using MPS (Metal Performance Shaders) for acceleration on Mac')
+        return device, "mps"
+    
+    device = torch.device("cpu")
+    logging.info('Using CPU for inference')
+    return device, "cpu"
 
 # Helper function for model loading
 def load_model_by_name(arch_name, checkpoint_path, device):
@@ -65,12 +86,8 @@ def load_model_by_name(arch_name, checkpoint_path, device):
     # Load model
     if arch_name == 'depthanything-large':
         model = DepthAnything(**model_kwargs['vitl']).to(device)
-        # checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"large/model.safetensors", repo_type="model")
-
     elif arch_name == 'depthanything-base':
         model = DepthAnythingV2(**model_kwargs['vitb']).to(device)
-        # checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"base/model.safetensors", repo_type="model")
-
     else:
         raise NotImplementedError(f"Unknown architecture: {arch_name}")
     
@@ -78,7 +95,8 @@ def load_model_by_name(arch_name, checkpoint_path, device):
     model_weights = load_file(checkpoint_path)
     model.load_state_dict(model_weights)
     del model_weights
-    torch.cuda.empty_cache()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     return model
 
 # Helper function for directory checks
@@ -86,8 +104,22 @@ def check_directory(directory):
     if not os.path.exists(directory):
         os.makedirs(directory, exist_ok=True)
 
+# MPS-compatible inference function
+def run_inference(model, input_tensor, device_type, arch_name):
+    if device_type == 'cuda':
+        with torch.autocast("cuda"):
+            pred_disp, _ = model(input_tensor) if 'midas' not in arch_name else model(input_tensor)
+    elif device_type == 'mps':
+        # MPS doesn't support autocast yet, but works well with standard precision
+        pred_disp, _ = model(input_tensor) if 'midas' not in arch_name else model(input_tensor)
+    else:
+        # For CPU, don't use autocast
+        pred_disp, _ = model(input_tensor) if 'midas' not in arch_name else model(input_tensor)
+    
+    return pred_disp
+
 # Image processing function
-def process_images(validation_images, image_logs_folder, transform, model, device):
+def process_images(validation_images, image_logs_folder, transform, model, device, device_type, arch_name):
     images = []
     for i, image_path in enumerate(validation_images):
         validation_image_np = cv2.imread(image_path, cv2.COLOR_BGR2RGB)[..., ::-1] / 255
@@ -95,8 +127,9 @@ def process_images(validation_images, image_logs_folder, transform, model, devic
         validation_image = transform({'image': validation_image_np})['image']
         validation_image = torch.from_numpy(validation_image).unsqueeze(0).to(device)
 
-        with torch.autocast("cuda"):
-            pred_disp, _ = model(validation_image) if 'midas' not in args.arch_name else model(validation_image)
+        # Use the MPS-compatible inference function
+        pred_disp = run_inference(model, validation_image, device_type, arch_name)
+            
         pred_disp_np = pred_disp.cpu().detach().numpy()[0, :, :, :].transpose(1, 2, 0)
         pred_disp = (pred_disp_np - pred_disp_np.min()) / (pred_disp_np.max() - pred_disp_np.min())
 
@@ -113,17 +146,19 @@ def process_images(validation_images, image_logs_folder, transform, model, devic
         images.append(image_out)
         image_out.save(osp.join(image_logs_folder, f'da_sota_{i}.jpg'))
         print(f'{i} OK')
-        torch.cuda.empty_cache()
+        
+        if device_type == 'cuda':
+            torch.cuda.empty_cache()
 
     return images
 
 def main(args, num_gpus):
-    gpu_id = comm.get_rank()
-    device = torch.device(f"cuda:{gpu_id}")
-    logging.info(f'GPU numbers: {num_gpus}')
+    # Check for device availability and set device accordingly
+    device, device_type = get_device(args)
 
     # Model preparation
     model = load_model_by_name(args.arch_name, args.checkpoint, device)
+    model.eval()  # Set model to evaluation mode for inference
 
     # Image directory check
     check_directory(args.output_dir)
@@ -141,10 +176,18 @@ def main(args, num_gpus):
         PrepareForNet()
     ])
 
-    images = process_images(validation_images, image_logs_folder, transform, model, device)
+    # Use device_type for MPS-compatible processing
+    images = process_images(validation_images, image_logs_folder, transform, model, device, device_type, args.arch_name)
     
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     args = argument_parser().parse_args()
-    num_gpus = torch.cuda.device_count()
-    launch(main, num_gpus, num_machines=1, machine_rank=0, dist_url='auto', args=(args, num_gpus))
+    
+    # Handle device selection
+    if torch.cuda.is_available() and not args.use_cpu:
+        num_gpus = torch.cuda.device_count()
+        launch(main, num_gpus, num_machines=1, machine_rank=0, dist_url='auto', args=(args, num_gpus))
+    else:
+        # For CPU or MPS (Apple Silicon), we don't need distributed launch
+        num_gpus = 0
+        main(args, num_gpus)

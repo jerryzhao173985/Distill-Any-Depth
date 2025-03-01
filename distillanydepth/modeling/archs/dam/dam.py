@@ -276,7 +276,8 @@ class DPTHead(nn.Module):
             else:
                 x = x[0]
             # import pdb;pdb.set_trace()
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            # Make tensor contiguous before reshaping to avoid the view error
+            x = x.permute(0, 2, 1).contiguous().reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
