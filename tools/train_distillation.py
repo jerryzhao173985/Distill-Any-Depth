@@ -41,10 +41,10 @@ def argument_parser():
     parser.add_argument("--teacher_checkpoints", nargs='+', required=True, help="Checkpoint paths for teacher models.")
     parser.add_argument("--student_arch", type=str, default="depthanything-base", choices=['depthanything-base'], help="Student model architecture.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for checkpoints and logs.")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for the optimizer.")
-    parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--num_iterations", type=int, default=20000, help="Number of training iterations.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the optimizer.")
+    parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs.")
+    parser.add_argument("--num_iterations", type=int, default=0, help="Number of training iterations (0 means train for num_epochs).")
     parser.add_argument("--global_crop_size", type=int, default=560, help="Size of the global crop for local-global distillation.")
     parser.add_argument("--local_crop_size", type=int, default=560, help="Size of the local crop for shared-context distillation.")
     parser.add_argument("--min_local_crop", type=int, default=384, help="Minimum size of local crop sampling.")
@@ -53,21 +53,40 @@ def argument_parser():
     parser.add_argument("--lambda_lg", type=float, default=0.5, help="Weight for local-global distillation loss.")
     parser.add_argument("--lambda_feat", type=float, default=1.0, help="Weight for feature alignment loss.")
     parser.add_argument("--lambda_grad", type=float, default=2.0, help="Weight for gradient preservation loss.")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers.")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of data loading workers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--checkpoint_interval", type=int, default=5000, help="Save checkpoint every N iterations.")
     parser.add_argument("--log_interval", type=int, default=100, help="Log training status every N iterations.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu", 
                         help="Device to use for training (cuda, mps, or cpu).")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with more verbose logging.")
+    
+    # Validation options
+    parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data to use for validation (0 to disable validation).")
+    
+    # Learning rate scheduler options
+    parser.add_argument("--use_scheduler", action="store_true", help="Use learning rate scheduler during training.")
+    parser.add_argument("--scheduler_type", type=str, default="cosine", choices=["cosine", "step"], help="Type of learning rate scheduler to use.")
+    parser.add_argument("--scheduler_step_size", type=int, default=10, help="Step size for StepLR scheduler (in epochs).")
+    parser.add_argument("--scheduler_gamma", type=float, default=0.1, help="Decay factor for StepLR scheduler.")
+    
+    # Additional hyperparameters
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay for optimizer.")
+    parser.add_argument("--gradient_clip", type=float, default=1.0, help="Gradient clipping value (0 to disable).")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of warmup epochs with lower learning rate.")
+    parser.add_argument("--early_stopping", type=int, default=10, help="Stop training if validation loss does not improve for N epochs (0 to disable).")
+    
     return parser
 
 
 # Custom dataset for loading images
 class ImageDataset(Dataset):
-    def __init__(self, image_dir, global_transform, local_transform, min_local_crop=384, logger=None):
-        self.image_paths = sorted(glob(os.path.join(image_dir, "**/*.jpg"), recursive=True) + 
-                                 glob(os.path.join(image_dir, "**/*.png"), recursive=True))
+    def __init__(self, image_dir, global_transform, local_transform, min_local_crop=384, logger=None, image_paths=None):
+        if image_paths is None:
+            self.image_paths = sorted(glob(os.path.join(image_dir, "**/*.jpg"), recursive=True) + 
+                                     glob(os.path.join(image_dir, "**/*.png"), recursive=True))
+        else:
+            self.image_paths = image_paths
         if len(self.image_paths) == 0:
             raise ValueError(f"No images found in {image_dir}")
             
@@ -259,14 +278,8 @@ def distillation_loss(student_depth, teacher_depth, norm_strategy, num_segments=
 
 def feature_alignment_loss(student_features, teacher_features):
     """Compute feature alignment loss between student and teacher features"""
-    # For testing purposes only: Skip feature alignment loss
-    # This allows us to verify the rest of the training pipeline works
-    return torch.tensor(0.0, device=student_features[0].device if isinstance(student_features, list) else student_features.device)
-    
-    # Feature alignment will be properly implemented in the full version
-    # Below is a placeholder for the full implementation
-    """
-    loss = 0
+    loss = 0.0
+    device = student_features[0].device if isinstance(student_features, list) else student_features.device
     
     # Check if feature dimensions match
     if isinstance(student_features, torch.Tensor) and isinstance(teacher_features, torch.Tensor):
@@ -274,7 +287,6 @@ def feature_alignment_loss(student_features, teacher_features):
         # Project student features to teacher dimension if needed
         if student_features.shape[1] != teacher_features.shape[1]:
             # Project student features to teacher feature dimension
-            # This is a simplified version for testing
             student_features = F.interpolate(
                 student_features.unsqueeze(2).unsqueeze(3), 
                 size=(1, teacher_features.shape[1])
@@ -289,6 +301,7 @@ def feature_alignment_loss(student_features, teacher_features):
         return loss
     
     # Handle case where we're comparing feature lists
+    valid_pairs = 0
     for i, (sf, tf) in enumerate(zip(student_features, teacher_features)):
         # Skip feature maps where dimensions are incompatible
         if sf.ndim != tf.ndim:
@@ -308,12 +321,13 @@ def feature_alignment_loss(student_features, teacher_features):
         
         # Compute cosine similarity loss
         loss += (1.0 - F.cosine_similarity(sf_norm, tf_norm, dim=1).mean())
+        valid_pairs += 1
     
-    num_valid_pairs = sum(1 for sf, tf in zip(student_features, teacher_features) 
-                          if sf.ndim == tf.ndim and sf.shape[1] == tf.shape[1])
-    
-    return loss / max(num_valid_pairs, 1)
-    """
+    # Return average loss
+    if valid_pairs > 0:
+        return loss / valid_pairs
+    else:
+        return torch.tensor(0.0, device=device)
 
 def gradient_preservation_loss(depth):
     """Compute gradient preservation loss to maintain edge sharpness"""
@@ -425,6 +439,101 @@ def extract_local_from_global(global_depth, crop_bbox, target_size):
     return torch.cat(crops, dim=0)
 
 
+def validate(model, teacher_model, val_dataloader, args, device, logger):
+    """Validate the model during training"""
+    model.eval()
+    teacher_model.eval()
+    
+    total_loss = 0.0
+    sc_loss_total = 0.0
+    lg_loss_total = 0.0
+    feat_loss_total = 0.0
+    grad_loss_total = 0.0
+    
+    num_samples = 0
+    logger.info("Running validation...")
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_dataloader):
+            # Move batch to device
+            global_image = batch['global_image'].to(device)
+            local_image = batch['local_image'].to(device)
+            
+            # Extract crop coordinates and reconstruct the bbox
+            crop_left = batch['crop_left'].tolist()
+            crop_top = batch['crop_top'].tolist()
+            crop_right = batch['crop_right'].tolist()
+            crop_bottom = batch['crop_bottom'].tolist()
+            
+            # Construct crop_bbox as a list of tuples (one per batch item)
+            crop_bbox = [(left, top, right, bottom) for left, top, right, bottom in 
+                         zip(crop_left, crop_top, crop_right, crop_bottom)]
+            
+            # Forward pass for student (for both global and local images)
+            student_global_disp, student_global_features = model(global_image)
+            student_local_disp, student_local_features = model(local_image)
+            
+            # Forward pass for teacher (for local image only in shared-context)
+            teacher_local_disp, teacher_local_features = teacher_model(local_image)
+            
+            # Shared-Context Distillation Loss
+            sc_loss = distillation_loss(
+                student_local_disp, 
+                teacher_local_disp, 
+                args.normalization, 
+                args.num_segments
+            )
+            
+            # Local-Global Distillation Loss
+            # Extract the local patch from the global depth map
+            student_global_local = extract_local_from_global(
+                student_global_disp, 
+                crop_bbox, 
+                (student_local_disp.shape[2], student_local_disp.shape[3])
+            )
+            
+            lg_loss = distillation_loss(
+                student_global_local, 
+                teacher_local_disp, 
+                args.normalization, 
+                args.num_segments
+            )
+            
+            # Feature Alignment Loss
+            feat_loss = feature_alignment_loss(student_local_features, teacher_local_features)
+            
+            # Gradient Preservation Loss
+            grad_loss = gradient_preservation_loss(student_global_disp)
+            
+            # Total Loss
+            loss = sc_loss + args.lambda_lg * lg_loss + args.lambda_feat * feat_loss + args.lambda_grad * grad_loss
+            
+            # Accumulate losses
+            batch_size = global_image.size(0)
+            num_samples += batch_size
+            total_loss += loss.item() * batch_size
+            sc_loss_total += sc_loss.item() * batch_size
+            lg_loss_total += lg_loss.item() * batch_size
+            feat_loss_total += feat_loss.item() * batch_size
+            grad_loss_total += grad_loss.item() * batch_size
+    
+    # Calculate average losses
+    avg_loss = total_loss / max(num_samples, 1)
+    avg_sc_loss = sc_loss_total / max(num_samples, 1)
+    avg_lg_loss = lg_loss_total / max(num_samples, 1)
+    avg_feat_loss = feat_loss_total / max(num_samples, 1)
+    avg_grad_loss = grad_loss_total / max(num_samples, 1)
+    
+    # Set model back to training mode
+    model.train()
+    
+    # Log validation metrics
+    logger.info(f"Validation Loss: {avg_loss:.4f} (SC: {avg_sc_loss:.4f}, "
+               f"LG: {avg_lg_loss:.4f}, Feat: {avg_feat_loss:.4f}, "
+               f"Grad: {avg_grad_loss:.4f})")
+    
+    return avg_loss
+
 def train(args, device):
     """Main training function"""
     # Set random seed for reproducibility
@@ -472,23 +581,76 @@ def train(args, device):
     
     # Create dataset and dataloader
     try:
-        dataset = ImageDataset(
-            args.dataset_dir, 
-            global_transform, 
-            local_transform,
-            min_local_crop=args.min_local_crop,
-            logger=logger
-        )
+        all_image_paths = sorted(glob(os.path.join(args.dataset_dir, "**/*.jpg"), recursive=True) + 
+                                glob(os.path.join(args.dataset_dir, "**/*.png"), recursive=True))
         
-        dataloader = DataLoader(
-            dataset, 
+        if len(all_image_paths) == 0:
+            raise ValueError(f"No images found in {args.dataset_dir}")
+        
+        # Split dataset into train and validation
+        if args.val_split > 0:
+            # Shuffle the dataset with fixed seed for reproducibility
+            random.seed(args.seed)
+            random.shuffle(all_image_paths)
+            
+            # Calculate split indices
+            val_size = int(len(all_image_paths) * args.val_split)
+            train_paths = all_image_paths[val_size:]
+            val_paths = all_image_paths[:val_size]
+            
+            logger.info(f"Split dataset: {len(train_paths)} training images, {len(val_paths)} validation images")
+            
+            # Create custom datasets
+            train_dataset = ImageDataset(
+                args.dataset_dir, 
+                global_transform, 
+                local_transform,
+                min_local_crop=args.min_local_crop,
+                logger=logger,
+                image_paths=train_paths
+            )
+            
+            val_dataset = ImageDataset(
+                args.dataset_dir, 
+                global_transform, 
+                local_transform,
+                min_local_crop=args.min_local_crop,
+                logger=logger,
+                image_paths=val_paths
+            )
+        else:
+            # No validation split, use all images for training
+            train_dataset = ImageDataset(
+                args.dataset_dir, 
+                global_transform, 
+                local_transform,
+                min_local_crop=args.min_local_crop,
+                logger=logger
+            )
+            val_dataset = None
+        
+        train_dataloader = DataLoader(
+            train_dataset, 
             batch_size=args.batch_size, 
             shuffle=True, 
             num_workers=args.num_workers,
             pin_memory=True
         )
         
-        logger.info(f"Created dataloader with {len(dataset)} images")
+        if val_dataset:
+            val_dataloader = DataLoader(
+                val_dataset, 
+                batch_size=args.batch_size, 
+                shuffle=False, 
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
+        else:
+            val_dataloader = None
+        
+        logger.info(f"Created dataloader with {len(train_dataset)} images for training")
+        if val_dataloader:
+            logger.info(f"Created dataloader with {len(val_dataset)} images for validation")
     except Exception as e:
         logger.error(f"Error creating dataset/dataloader: {e}")
         raise
@@ -512,15 +674,66 @@ def train(args, device):
         logger.error(f"Error loading teacher model: {e}")
         raise
     
-    # Set up optimizer
-    optimizer = optim.Adam(student_model.parameters(), lr=args.lr)
+    # Set up optimizer with learning rate scheduler and weight decay
+    optimizer = optim.Adam(student_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # Training loop
+    # Implement warmup learning rate
+    if args.warmup_epochs > 0:
+        warmup_lr_scheduler = None
+        def warmup_lambda(epoch):
+            if epoch < args.warmup_epochs:
+                return epoch / args.warmup_epochs
+            return 1.0
+        
+        warmup_lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_lambda)
+    
+    # Main learning rate scheduler (after warmup)
+    main_scheduler = None
+    if args.use_scheduler:
+        if args.scheduler_type == "cosine":
+            main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, 
+                T_max=args.num_epochs * len(train_dataloader), 
+                eta_min=args.lr * 0.01
+            )
+        elif args.scheduler_type == "step":
+            main_scheduler = optim.lr_scheduler.StepLR(
+                optimizer, 
+                step_size=args.scheduler_step_size * len(train_dataloader), 
+                gamma=args.scheduler_gamma
+            )
+    
+    # Combine schedulers: warmup followed by main scheduler
+    if args.warmup_epochs > 0 and args.use_scheduler:
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, 
+            schedulers=[warmup_lr_scheduler, main_scheduler],
+            milestones=[args.warmup_epochs * len(train_dataloader)]
+        )
+    elif args.warmup_epochs > 0:
+        scheduler = warmup_lr_scheduler
+    elif args.use_scheduler:
+        scheduler = main_scheduler
+    else:
+        scheduler = None
+    
+    # Initialize tracking variables
     global_step = 0
     start_time = time.time()
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
     
     # Calculate total steps based on number of iterations or epochs
-    max_steps = args.num_iterations if args.num_iterations > 0 else args.num_epochs * len(dataloader)
+    max_steps = args.num_iterations if args.num_iterations > 0 else args.num_epochs * len(train_dataloader)
+    
+    # Create a directory for plots
+    plots_dir = os.path.join(args.output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Initialize lists to store metrics for plotting
+    train_losses = []
+    val_losses = []
+    lr_values = []
     
     logger.info(f"Starting training for {max_steps} steps")
     student_model.train()
@@ -530,7 +743,10 @@ def train(args, device):
             if args.num_iterations > 0 and global_step >= args.num_iterations:
                 break
                 
-            for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
                 if args.num_iterations > 0 and global_step >= args.num_iterations:
                     break
                     
@@ -548,7 +764,7 @@ def train(args, device):
                 crop_bbox = [(left, top, right, bottom) for left, top, right, bottom in 
                              zip(crop_left, crop_top, crop_right, crop_bottom)]
                 
-                # Log shapes
+                # Log shapes if in debug mode
                 if global_step == 0 or args.debug:
                     logger.debug(f"Global image shape: {global_image.shape}")
                     logger.debug(f"Local image shape: {local_image.shape}")
@@ -569,7 +785,7 @@ def train(args, device):
                 with torch.no_grad():
                     teacher_local_disp, teacher_local_features = teacher_model(local_image)
                 
-                # Log shapes
+                # Log shapes if in debug mode
                 if global_step == 0 or args.debug:
                     logger.debug(f"Student global disp shape: {student_global_disp.shape}")
                     logger.debug(f"Student local disp shape: {student_local_disp.shape}")
@@ -609,7 +825,24 @@ def train(args, device):
                 
                 # Backward pass and optimizer step
                 total_loss.backward()
+                
+                # Apply gradient clipping if enabled
+                if args.gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.gradient_clip)
+                
                 optimizer.step()
+                
+                # Update learning rate if using scheduler
+                if scheduler:
+                    scheduler.step()
+                    current_lr = scheduler.get_last_lr()[0]
+                else:
+                    current_lr = args.lr
+                
+                # Track metrics
+                epoch_loss += total_loss.item()
+                num_batches += 1
+                lr_values.append(current_lr)
                 
                 # Logging
                 if global_step % args.log_interval == 0:
@@ -618,6 +851,7 @@ def train(args, device):
                               f"Loss: {total_loss.item():.4f} (SC: {sc_loss.item():.4f}, "
                               f"LG: {lg_loss.item():.4f}, Feat: {feat_loss.item():.4f}, "
                               f"Grad: {grad_loss.item():.4f}) | "
+                              f"LR: {current_lr:.6f} | "
                               f"Time: {elapsed_time:.2f}s")
                 
                 # Checkpoint saving
@@ -627,6 +861,59 @@ def train(args, device):
                     logger.info(f"Saved checkpoint at step {global_step} to {checkpoint_path}")
                 
                 global_step += 1
+            
+            # End of epoch
+            avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+            train_losses.append(avg_epoch_loss)
+            
+            logger.info(f"Epoch {epoch+1}/{args.num_epochs} completed | Avg Loss: {avg_epoch_loss:.4f}")
+            
+            # Run validation if validation set is available
+            if val_dataloader:
+                # Use the first teacher model for validation
+                val_loss = validate(student_model, teacher_models[0], val_dataloader, args, device, logger)
+                val_losses.append(val_loss)
+                
+                # Save best model based on validation loss
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_model_path = os.path.join(args.output_dir, "student_best.safetensors")
+                    save_file(student_model.state_dict(), best_model_path)
+                    logger.info(f"New best model saved with validation loss: {best_val_loss:.4f}")
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    logger.info(f"Validation did not improve. Epochs without improvement: {epochs_without_improvement}")
+                    
+                    # Check for early stopping
+                    if args.early_stopping > 0 and epochs_without_improvement >= args.early_stopping:
+                        logger.info(f"Early stopping triggered after {epochs_without_improvement} epochs without improvement")
+                        break
+            
+            # Plot training curves at the end of each epoch
+            if epoch % 5 == 0 or epoch == args.num_epochs - 1:  # Plot every 5 epochs or on the last epoch
+                # Plot training loss
+                plt.figure(figsize=(10, 6))
+                plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+                if val_dataloader:
+                    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+                plt.xlabel('Epochs')
+                plt.ylabel('Loss')
+                plt.title('Training and Validation Loss')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(plots_dir, f'loss_epoch_{epoch+1}.png'))
+                plt.close()
+                
+                # Plot learning rate
+                plt.figure(figsize=(10, 6))
+                plt.plot(range(1, len(lr_values) + 1), lr_values)
+                plt.xlabel('Steps')
+                plt.ylabel('Learning Rate')
+                plt.title('Learning Rate Schedule')
+                plt.grid(True)
+                plt.savefig(os.path.join(plots_dir, f'lr_epoch_{epoch+1}.png'))
+                plt.close()
         
         # Save final model
         final_checkpoint_path = os.path.join(args.output_dir, f"student_final.safetensors")
