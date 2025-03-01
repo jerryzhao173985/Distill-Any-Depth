@@ -5,8 +5,11 @@
 # Set environment variables
 export PYTHONPATH="$PYTHONPATH:$(pwd)"
 
+# Set MPS fallback for operations not implemented on MPS (like nanmedian)
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+
 # Define paths
-DATASET_DIR="path/to/your/large/dataset"  # Replace with your actual dataset path
+DATASET_DIR="data/train_test"  # Replace with your actual dataset path
 OUTPUT_DIR="output/full_training"
 TEACHER_CHECKPOINT="checkpoint/large/model.safetensors"
 
@@ -31,6 +34,10 @@ python tools/train_distillation.py \
   --lambda_lg 0.5 \
   --lambda_feat 1.0 \
   --lambda_grad 2.0 \
+  --use_hdn_loss \
+  --hdn_variant dr \
+  --hdn_level 3 \
+  --lambda_hdn 1.0 \
   --num_workers 8 \
   --seed 42 \
   --checkpoint_interval 5000 \

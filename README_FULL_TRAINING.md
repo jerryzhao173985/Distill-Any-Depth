@@ -33,6 +33,21 @@ data/
 
 The feature alignment loss has been fully implemented to enable effective knowledge transfer from the teacher model to the student model. This loss encourages the student to learn similar feature representations as the teacher, leading to better depth prediction.
 
+## Hierarchical Depth Normalization (HDN)
+
+The training pipeline now incorporates Hierarchical Depth Normalization (HDN), a novel multi-scale depth normalization method that significantly improves depth estimation accuracy. HDN works by:
+
+1. Hierarchically normalizing depth representations based on spatial information and depth distributions
+2. Preserving fine-grained details that might be lost with global normalization methods
+3. Creating multiple normalization contexts at different scales to capture depth relationships at various levels
+
+Three HDN variants are available:
+- **DR (Depth Ranges)**: Creates contexts based on ranges of depth values
+- **DP (Depth Percentiles)**: Creates contexts based on percentiles of depth distribution
+- **DS (Depth Spatial)**: Creates contexts based on spatial regions in the image
+
+The multi-scale approach allows the model to better understand both global scene structure and fine-grained depth differences, leading to more accurate depth estimation.
+
 ## Hyperparameter Configuration
 
 The full training script (`scripts/train_full.sh`) includes optimized hyperparameters:
